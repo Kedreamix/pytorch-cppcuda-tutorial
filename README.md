@@ -1,5 +1,27 @@
 # CUDA编程学习：自定义Pytorch+cpp/cuda extension
 
+- [CUDA编程学习：自定义Pytorch+cpp/cuda extension](#cuda编程学习自定义pytorchcppcuda-extension)
+  - [学习背景](#学习背景)
+  - [适用对象与场景](#适用对象与场景)
+  - [Pytorch和CUDA的关系](#pytorch和cuda的关系)
+  - [Python调用C++函数（桥梁）](#python调用c函数桥梁)
+    - [Building with `setuptools`](#building-with-setuptools)
+    - [JIT Compiling Extensions](#jit-compiling-extensions)
+  - [CUDA加速的原理](#cuda加速的原理)
+  - [三线性插值问题定义](#三线性插值问题定义)
+  - [C++调用CUDA函数](#c调用cuda函数)
+  - [三线性插值CUDA实现](#三线性插值cuda实现)
+    - [scalar\_t类型](#scalar_t类型)
+    - [accessors](#accessors)
+    - [模板函数](#模板函数)
+    - [foward验证与比较](#foward验证与比较)
+  - [CUDA反向传播](#cuda反向传播)
+    - [定义CUDA函数](#定义cuda函数)
+    - [核函数实现微分计算](#核函数实现微分计算)
+    - [PYBIND11绑定函数](#pybind11绑定函数)
+    - [torch.autograd.Function封装](#torchautogradfunction封装)
+    - [backward验证与比较](#backward验证与比较)
+  - [参考](#参考)
 
 
 ## 学习背景
@@ -140,7 +162,8 @@ setup(
 from torch.utils.cpp_extension import load
 
 cppcuda_tutorial = load(name="cppcuda_tutorial",
-                        sources=['interpolation.cpp'])
+                        # extra_include_paths=include_dirs,
+                        sources=['interpolation.cpp'],)
 ```
 
 在这里，实际提供的是域setuptools相同的信息。在后台，这将执行以下操作：
@@ -523,7 +546,7 @@ __global__ void trilinear_fw_kernel(
 }
 ```
 
-### 验证与比较
+### foward验证与比较
 
 经过`python setup.py install`以后（每次修改后都要重新运行`setup.py`），我们就可以进行运行了，在这里面为了验证结果的正确性和与python进行比较，用python实现三线性插值的算法，比较两者的结果和时间效率，`test.py`如下：
 
@@ -592,18 +615,229 @@ True
 
 在上述实验中，当我们尝试添加自动求导的梯度计算时，使用`requires_grad_`，我们会发现通过CUDA返回的值实际上不会自动进行梯度计算（autograd）。然而，如果我们在Python中进行计算，它会自动进行梯度计算。
 
-然而，在实际应用中，神经网络经常需要计算损失函数，并使用梯度下降等优化算法来不断优化参数。但是，在CUDA编程中，C++扩展API并没有提供自动求导（autograd）的方法。因此，我们必须自己实现反向传播的代码，计算每个输入的导数，并将其放置在`torch.autograd.Function`中。
+然而，在实际应用中，神经网络经常需要计算损失函数，并使用梯度下降等优化算法来不断优化参数。但是，在CUDA编程中，C++扩展API并没有提供自动求导（autograd）的方法。因此，我们必须自己实现反向传播的代码，计算每个输入的导数，并将其封装在`torch.autograd.Function`中。
 
 在CUDA编程中，实现反向传播的代码通常包括以下步骤：
 
 1. 在C++扩展中，创建一个新类，继承自`torch::autograd::Function`，用于定义前向传播和反向传播操作。
-2. 在新类中，重写`forward()`方法，定义前向传播的操作。这些操作将使用CUDA执行计算，并返回结果。
+2. 在新类中，重写`forward()`方法，定义前向传播的操作。这些操作将使用CUDA执行计算，并返回结果，其实就是上述的cuda的部分。
 3. 在新类中，重写`backward()`方法，定义反向传播的操作。这些操作将计算输入张量的梯度，并传递给上一层。
-4. 在C++扩展中，将新类注册为PyTorch的自定义函数。
+4. 在CUDA和C++中，编写对应的`forward`和`backward`函数，计算前向传播和微分。
 5. 在Python代码中，使用这个自定义函数执行前向传播，并通过调用`backward()`方法执行反向传播。
 6. 在反向传播过程中，梯度将通过CUDA计算，并在每个层之间传递，从而计算出每个输入的导数。
 
 通过这种方式，我们可以在CUDA编程中手动实现反向传播，并获得每个输入的梯度，以便进行优化算法的参数更新。尽管需要手动编写反向传播代码，但这使我们能够在CUDA扩展中自定义梯度计算，并与PyTorch的自动求导机制无缝配合。
+
+我们还是把三线性插值作为我们的一个例子，编写对应的反向传播，根据问题设定，我们可以知道我们的Points是固定的，所以我们需要对我们的Feats进行求微分。我们以简单的双线性插值来学习一下，怎么求微分，这里面其实涉及高数的知识，当然我们也可以把函数交给一些数学网站帮我们求得结果。**从下图我们可以看到，`f`是双线性插值的结果，我们可以得到对应的四个导数，我们会发现实际上，他们的微分是对应的系数，推导在三线性插值也是一样的，所以他们对应的微分也就是对应的前缀。**
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/direct/c35a354c6fcb49678872728cf04e6306.png)
+
+
+
+在计算反向传播前，我们往往会有一个对应的一个损失`Loss`，然后再进行求微分，这里面其实就用到了高数里面的链式法则，使用链式法则我们就可以得到`L`对每一个`feat`的微分，明白了双线性插值的计算，我们也可以推导在三线性插值中。
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/direct/777b69824dcf4ca0ba257613067fa9be.png)
+
+### 定义CUDA函数
+
+明白了理论的计算，我们就可以进行对应的实现，首先我们可以编写对应的反向传播的CUDA函数，这一部分实际上和前向传播是一样的，首先我们还是定义反向传播函数，在这里和前向传播函数的不同就是对名字进行了修改，除此之外加入了两个参数，分别是`dL_dfeats`参数和`dL_dfeats`。简单解释一下这些参数，在问题的设定中，我们的`feats`的维度是的(N, 8, F)，所以我们的微分`dL_dfeats`的维度是和`feats`是一样的，然后再加入反向传播的核函数中即可；`dL_dfeat_interp`则是根据函数已知的，所以不用计算，直接传参数。
+
+```C++
+torch::Tensor trilinear_bw_cu(
+    const torch::Tensor dL_dfeat_interp,
+    const torch::Tensor feats,
+    const torch::Tensor points
+){
+    const int N = feats.size(0), F = feats.size(2);
+    
+    torch::Tensor dL_dfeats = torch::empty({N, 8, F}, feats.options());
+
+    const dim3 threads(16, 16);
+    const dim3 blocks((N+threads.x-1)/threads.x, (F+threads.y-1)/threads.y);
+
+    AT_DISPATCH_FLOATING_TYPES(feats.type(), "trilinear_bw_cu", 
+    ([&] {
+        trilinear_bw_kernel<scalar_t><<<blocks, threads>>>(
+            dL_dfeat_interp.packed_accessor<scalar_t, 2, torch::RestrictPtrTraits, size_t>(),
+            feats.packed_accessor<scalar_t, 3, torch::RestrictPtrTraits, size_t>(),
+            points.packed_accessor<scalar_t, 2, torch::RestrictPtrTraits, size_t>(),
+            dL_dfeats.packed_accessor<scalar_t, 3, torch::RestrictPtrTraits, size_t>()
+        );
+    }));
+
+    return dL_dfeats;
+}
+```
+
+### 核函数实现微分计算
+
+接下来就是主要的核函数的实现，在这一部分我们就需要实现微分的计算，在前面已经介绍了双线性插值的微分的计算，推导在三线性插值是一样的，我们可以根据前向传播的代码，这一部分只需要保留前面的系数✖️对应位置的`dL_dfeat_interp`就可以得到最后的微分值，这一部分跟上述的推导是一模一样的。
+
+```C++
+template <typename scalar_t>
+__global__ void trilinear_bw_kernel(
+    const torch::PackedTensorAccessor<scalar_t, 2, torch::RestrictPtrTraits, size_t> dL_dfeat_interp,
+    const torch::PackedTensorAccessor<scalar_t, 3, torch::RestrictPtrTraits, size_t> feats,
+    const torch::PackedTensorAccessor<scalar_t, 2, torch::RestrictPtrTraits, size_t> points,
+    torch::PackedTensorAccessor<scalar_t, 3, torch::RestrictPtrTraits, size_t> dL_dfeats
+){
+    const int n = blockIdx.x * blockDim.x + threadIdx.x;
+    const int f = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (n>=feats.size(0) || f>=feats.size(2)) return;
+
+    // point -1~1
+    const scalar_t u = (points[n][0]+1)/2;
+    const scalar_t v = (points[n][1]+1)/2;
+    const scalar_t w = (points[n][2]+1)/2;
+    
+    const scalar_t a = (1-v)*(1-w);
+    const scalar_t b = (1-v)*w;
+    const scalar_t c = v*(1-w);
+    const scalar_t d = 1-a-b-c;
+
+    dL_dfeats[n][0][f] = (1-u)*a*dL_dfeat_interp[n][f];
+    dL_dfeats[n][1][f] = (1-u)*b*dL_dfeat_interp[n][f];
+    dL_dfeats[n][2][f] = (1-u)*c*dL_dfeat_interp[n][f];
+    dL_dfeats[n][3][f] = (1-u)*d*dL_dfeat_interp[n][f];
+    dL_dfeats[n][4][f] = u*a*dL_dfeat_interp[n][f];
+    dL_dfeats[n][5][f] = u*b*dL_dfeat_interp[n][f];
+    dL_dfeats[n][6][f] = u*c*dL_dfeat_interp[n][f];
+    dL_dfeats[n][7][f] = u*d*dL_dfeat_interp[n][f];
+}
+```
+
+### PYBIND11绑定函数
+
+写好了反向传播函数之后，不要忘记绑定函数，这样我们才能在最后的python中调用对应的函数。
+
+```C++
+torch::Tensor trilinear_interpolation_fw(
+    const torch::Tensor feats,
+    const torch::Tensor points
+){
+    CHECK_INPUT(feats);
+    CHECK_INPUT(points);
+
+    return trilinear_fw_cu(feats, points);
+}
+
+
+torch::Tensor trilinear_interpolation_bw(
+    const torch::Tensor dL_dfeat_interp,
+    const torch::Tensor feats,
+    const torch::Tensor points
+){
+    CHECK_INPUT(dL_dfeat_interp);
+    CHECK_INPUT(feats);
+    CHECK_INPUT(points);
+
+    return trilinear_bw_cu(dL_dfeat_interp, feats, points);
+}
+
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m){
+    m.def("trilinear_interpolation_fw", &trilinear_interpolation_fw);
+    m.def("trilinear_interpolation_bw", &trilinear_interpolation_bw);
+}
+```
+
+### torch.autograd.Function封装
+
+为了使用pytorch的`autograd`我们还差最后一步，就是使用`torch.autograd.Function`进行封装，不然的话不能进行反向传播，会出现一些奇奇怪怪的bug。
+
+在下面的代码中，首先，我们需要定义`forward`和`backward`函数，**记得我们都需要定义`@staticmethod`装饰器，这个是一定要的。**接下来我们就可以开始完善`forward`和`backward`函数。在两个函数中，实际上我们就是调用C++扩展写好的函数，这里面唯一一个需要注意的就是`ctx`，实际上这里是`context`的缩写，这里就是表示有什么数据需要进行保存在反向传播中使用到，因为在`backward`我们还要传入对应的`feats`和`points`，所以在这里这两个参数都需要`save_for_backward`。
+
+最后的`backward`就更简单了，传入的参数与`forward`返回的参数进行对应，接着我们从`ctx`取出需要用到的参数，从`ctx.saved_tensors`中取出，后续只需要调用对应的C++函数即可，在这里面我们返回了两个参数，分别是`dL_dfeats, None`，这一部分是因为实际上是因为，我们有两个参数，分别`feats, points`，而我们并没有对`points`进行计算微分，所以这里就返回None。
+
+```python
+class Trilinear_interpolation_cuda(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, feats, points):
+        feat_interp = cppcuda_tutorial.trilinear_interpolation_fw(feats, points)
+
+        ctx.save_for_backward(feats, points)
+
+        return feat_interp
+
+    @staticmethod
+    def backward(ctx, dL_dfeat_interp):
+        feats, points = ctx.saved_tensors
+
+        dL_dfeats = cppcuda_tutorial.trilinear_interpolation_bw(dL_dfeat_interp.contiguous(), feats, points)
+
+        return dL_dfeats, None
+```
+
+### backward验证与比较
+
+和上述一样，经过`python setup.py install`以后（每次修改后都要重新运行`setup.py`），我们就可以进行运行了，在这里面为了验证结果的正确性和与pytorch本身的反向传播进行比较，比较两者的结果和时间效率，`test.py`的主函数如下：
+
+```python
+class Trilinear_interpolation_cuda(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, feats, points):
+        feat_interp = cppcuda_tutorial.trilinear_interpolation_fw(feats, points)
+
+        ctx.save_for_backward(feats, points)
+
+        return feat_interp
+
+    @staticmethod
+    def backward(ctx, dL_dfeat_interp):
+        feats, points = ctx.saved_tensors
+
+        dL_dfeats = cppcuda_tutorial.trilinear_interpolation_bw(dL_dfeat_interp.contiguous(), feats, points)
+
+        return dL_dfeats, None
+
+
+if __name__ == '__main__':
+    N = 65536; F = 256
+    rand = torch.rand(N, 8, F, device='cuda')
+    feats = rand.clone().requires_grad_()
+    feats2 = rand.clone().requires_grad_()
+    points = torch.rand(N, 3, device='cuda')*2-1
+
+    t = time.time()
+    # 调用CUDA计算
+    out_cuda = Trilinear_interpolation_cuda.apply(feats2, points)
+    torch.cuda.synchronize()
+    print('   cuda fw time', time.time()-t, 's')
+
+    t = time.time()
+    out_py = trilinear_interpolation_py(feats, points)
+    torch.cuda.synchronize()
+    print('pytorch fw time', time.time()-t, 's')
+
+    print('fw all close', torch.allclose(out_py, out_cuda))
+
+    t = time.time()
+    # CUDA反向传播
+    loss2 = out_cuda.sum()
+    loss2.backward()
+    torch.cuda.synchronize()
+    print('   cuda bw time', time.time()-t, 's')
+
+    t = time.time()
+    loss = out_py.sum()
+    loss.backward()
+    torch.cuda.synchronize()
+    print('pytorch bw time', time.time()-t, 's')
+
+    print('bw all close', torch.allclose(feats.grad, feats2.grad))
+```
+
+经过运行和计算后，我们会得到以下结果，我们可以看到，CUDA和Pytorch前向传播相差不大，但是对于反向传播的效率可以看得出来，结果大概差了10倍所有，CUDA的反向传播还是有一个较为明显的效率提升的。
+
+```bash
+   cuda fw time 0.0033109188079833984 s
+pytorch fw time 0.004142045974731445 s
+fw all close True
+   cuda bw time 0.004648447036743164 s
+pytorch bw time 0.04614758491516113 s
+bw all close True
+```
 
 
 
